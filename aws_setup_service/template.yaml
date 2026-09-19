@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: GitHub Agent one-time AWS setup callback service
+
+Resources:
+  SetupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token_hash
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  CallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 15
+      MemorySize: 128
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SetupTable
+      Environment:
+        Variables:
+          SETUP_TABLE_NAME: !Ref SetupTable
+      Events:
+        Callback:
+          Type: HttpApi
+          Properties:
+            Path: /callback
+            Method: POST
+        Status:
+          Type: HttpApi
+          Properties:
+            Path: /status/{token}
+            Method: GET
+
+Outputs:
+  CallbackURL:
+    Description: Set AWS_SETUP_CALLBACK_URL in the Streamlit app to this URL + /callback
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/callback"
+  StatusURL:
+    Description: Base status URL; append /{token}
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/status"
