@@ -1,0 +1,238 @@
+name: GitHub Agent - AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Agent AWS operation
+        required: true
+        type: choice
+        options:
+          - deploy
+          - check_space
+          - free_space
+          - resize_volume
+          - run_command
+      instance_id:
+        description: EC2 instance ID; blank means Name=github_App
+        required: false
+        default: ""
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+      port:
+        description: Host port for deploy
+        required: false
+        default: ""
+      command:
+        description: Approved SSM command
+        required: false
+        default: ""
+      add_gb:
+        description: GB to add for resize_volume
+        required: false
+        default: "10"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  aws:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      AWS_PAGER: ""
+    steps:
+      - name: Checkout
+        if: inputs.operation == 'deploy'
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::168288133704:role/GitHubAgentDeploymentRole
+          aws-region: ${{ inputs.region }}
+          role-session-name: GitHubAgent-${{ github.run_id }}
+
+      - name: Verify AWS account
+        run: |
+          set -euo pipefail
+          echo "AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)"
+          echo "AWS_REGION=$AWS_REGION"
+
+      - name: Resolve EC2
+        id: target
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.instance_id }}" ]; then
+            ID="${{ inputs.instance_id }}"
+          else
+            ID="$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=github_App" --query 'Reservations[].Instances[].InstanceId' --output text | awk '{print $1}')"
+          fi
+          test -n "$ID" && test "$ID" != "None" || { echo "No running EC2 found. Give instance_id or tag an instance Name=github_App."; exit 2; }
+          echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy project to EC2
+        if: inputs.operation == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          REPO="${GITHUB_REPOSITORY}"
+          BRANCH="${GITHUB_REF_NAME}"
+          PORT="${{ inputs.port }}"
+          SLUG="$(echo "${REPO##*/}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')"
+          [ -n "$SLUG" ] || SLUG="app"
+          CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          CLONE_URL_B64="$(printf '%s' "$CLONE_URL" | base64 -w0)"
+
+          cat > /tmp/agent-deploy.sh <<'SCRIPT'
+          set -euo pipefail
+          APP_ROOT=/opt/github-agent/apps
+          REPO_URL="$(printf '%s' "__CLONE_URL_B64__" | base64 -d)"
+          BRANCH="__BRANCH__"
+          SLUG="__SLUG__"
+          APP_DIR="$APP_ROOT/$SLUG"
+          mkdir -p "$APP_ROOT"
+          if ! command -v git >/dev/null 2>&1; then
+            sudo dnf install -y git >/dev/null 2>&1 || sudo yum install -y git >/dev/null 2>&1 || (sudo apt-get update -y >/dev/null 2>&1 && sudo apt-get install -y git >/dev/null 2>&1)
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            curl -fsSL https://get.docker.com | sudo sh >/dev/null 2>&1 || true
+          fi
+          sudo systemctl enable --now docker >/dev/null 2>&1 || sudo service docker start >/dev/null 2>&1 || true
+          command -v git >/dev/null 2>&1 || { echo "git could not be installed"; exit 4; }
+          command -v docker >/dev/null 2>&1 || { echo "docker could not be installed"; exit 4; }
+          if [ -d "$APP_DIR/.git" ]; then
+            git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH"
+            git -C "$APP_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+            git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+          else
+            rm -rf "$APP_DIR"
+            git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+          fi
+          cd "$APP_DIR"
+          if [ ! -f Dockerfile ]; then
+            test -f app.py && test -f requirements.txt || { echo "No Dockerfile and no app.py + requirements.txt found."; exit 2; }
+            cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.12-slim
+          WORKDIR /app
+          ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          EXPOSE 8501
+          CMD ["streamlit","run","app.py","--server.address=0.0.0.0","--server.port=8501","--server.headless=true"]
+          DOCKERFILE
+          fi
+          docker container prune -f >/dev/null 2>&1 || true
+          docker image prune -af >/dev/null 2>&1 || true
+          ROOT_USE="$(df -P / | tail -1 | awk '{gsub("%","",$5); print $5}')"
+          if [ "${ROOT_USE:-0}" -ge 85 ] 2>/dev/null; then docker system prune -af --volumes >/dev/null 2>&1 || true; fi
+          IMAGE="agent/$SLUG:latest"
+          CONTAINER="agent-$SLUG"
+          docker build -t "$IMAGE" .
+          if [ -z "__PORT__" ]; then
+            PORT=""
+            for CANDIDATE in $(seq 8501 8599); do
+              if ! docker ps --format '{{.Ports}}' | grep -Eq "(^|[:,])${CANDIDATE}->|:${CANDIDATE}-"; then PORT="$CANDIDATE"; break; fi
+            done
+          else
+            PORT="__PORT__"
+          fi
+          test -n "$PORT" || { echo "No free host port found"; exit 3; }
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          docker run -d --restart unless-stopped --name "$CONTAINER" -p "$PORT:8501" "$IMAGE"
+          echo "PORT=$PORT"
+          echo "CONTAINER=$CONTAINER"
+          echo "IMAGE=$IMAGE"
+          SCRIPT
+          sed -i "s#__CLONE_URL_B64__#${CLONE_URL_B64}#g; s#__BRANCH__#${BRANCH}#g; s#__SLUG__#${SLUG}#g; s#__PORT__#${PORT}#g" /tmp/agent-deploy.sh
+          COMMAND_B64="$(base64 -w0 /tmp/agent-deploy.sh)"
+          PARAMS_JSON="$(jq -nc --arg c "echo $COMMAND_B64 | base64 -d | bash" "{commands:[\$c]}")"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "$PARAMS_JSON" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 180); do
+            STATUS="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$STATUS" = "Success" ]; then
+              OUT="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text)"
+              echo "$OUT"
+              PUBLIC="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+              HOST="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)"
+              H="$PUBLIC"; [ "$H" = "None" ] || [ -z "$H" ] && H="$HOST"
+              ACTUAL_PORT="$(printf '%s\n' "$OUT" | awk -F= '/^PORT=/{print $2}' | tail -1)"
+              SG="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)"
+              aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port "$ACTUAL_PORT" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+              echo "INSTANCE_ID=$ID"
+              echo "PUBLIC_HOST=$H"
+              echo "ACTUAL_PORT=$ACTUAL_PORT"
+              echo "AGENT_LIVE_URL=http://${H}:${ACTUAL_PORT}"
+              exit 0
+            fi
+            if [[ "$STATUS" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then
+              aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
+
+      - name: Check EC2 space
+        if: inputs.operation == 'check_space'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["df -h /; echo; docker system df 2>/dev/null || true; echo; free -h; echo; uptime"]' --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 60); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Free EC2 space
+        if: inputs.operation == 'free_space'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["docker container prune -f; docker image prune -af; docker builder prune -af; docker volume prune -f; sudo journalctl --vacuum-size=50M || true; df -h /"]' --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 90); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Resize root EBS volume
+        if: inputs.operation == 'resize_volume'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          VOL="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)"
+          CUR="$(aws ec2 describe-volumes --volume-ids "$VOL" --query 'Volumes[0].Size' --output text)"
+          TARGET=$((CUR + ${{ inputs.add_gb }}))
+          aws ec2 modify-volume --volume-id "$VOL" --size "$TARGET"
+          echo "Requested EBS resize: ${CUR}GB -> ${TARGET}GB"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["lsblk; command -v growpart >/dev/null 2>&1 && sudo growpart /dev/xvda 1 || true; sudo resize2fs /dev/xvda1 2>/dev/null || sudo xfs_growfs -d / 2>/dev/null || true; df -h /"]' --query 'Command.CommandId' --output text)"
+          sleep 5
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text || true
+
+      - name: Run approved command
+        if: inputs.operation == 'run_command'
+        run: |
+          set -euo pipefail
+          test -n "${{ inputs.command }}" || { echo "No command supplied"; exit 2; }
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "commands=[${{ toJSON(inputs.command) }}]" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 120); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
