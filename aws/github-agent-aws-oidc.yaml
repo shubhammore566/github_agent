@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub Agent - passwordless AWS deployment access via GitHub Actions OIDC, with an optional self-provisioned EC2 host
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: YOUR_GITHUB_OWNER
+  GitHubRepo:
+    Type: String
+    Default: '*'
+    Description: Leave as '*' to allow every repo under GitHubOwner to deploy with this role, or set one exact repo name to restrict it.
+  GitHubBranch:
+    Type: String
+    Default: '*'
+    Description: Leave as '*' to allow any branch, or set one exact branch name to restrict it.
+  CreateOIDCProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set to 'false' if this AWS account already has a GitHub Actions OIDC provider (token.actions.githubusercontent.com) - an AWS account can only have one.
+  CreateEC2Instance:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set to 'false' if you already have your own EC2 instance (tagged Name=github_App, with the SSM agent running) and do not want this stack to create a new one.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Only used when CreateEC2Instance is true. t3.micro / t2.micro are AWS Free Tier eligible for the first 12 months.
+  SetupToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Temporary token used only to complete automatic setup in the GitHub Agent.
+  CallbackURL:
+    Type: String
+    Default: ''
+    Description: HTTPS endpoint used by the one-time setup callback. Leave blank to use manual connection.
+Conditions:
+  ShouldCreateOIDCProvider: !Equals [!Ref CreateOIDCProvider, 'true']
+  ShouldCreateEC2: !Equals [!Ref CreateEC2Instance, 'true']
+  ShouldCallback: !And [!Not [!Equals [!Ref SetupToken, '']], !Not [!Equals [!Ref CallbackURL, '']]]
+Resources:
+  GitHubActionsOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+  GitHubAgentDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GitHubAgentDeploymentRole
+      Description: Short-lived role for GitHub Agent deployments
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: GitHubAgentEC2Deployment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:AuthorizeSecurityGroupIngress
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Name: github_App
+              - Effect: Allow
+                Action: ec2:ModifyVolume
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/Name: github_App
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:*::document/AWS-RunShellScript'
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+  GitHubAgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateEC2
+    Properties:
+      GroupDescription: GitHub Agent host - app ports are opened dynamically by the Agent itself at deploy time
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Optional SSH access (AWS Systems Manager Session Manager also works without this)
+      Tags:
+        - Key: Name
+          Value: github_App
+  GitHubAgentInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateEC2
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  GitHubAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: ShouldCreateEC2
+    Properties:
+      Roles:
+        - !Ref GitHubAgentInstanceRole
+  GitHubAgentEC2Instance:
+    Type: AWS::EC2::Instance
+    Condition: ShouldCreateEC2
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref GitHubAgentInstanceProfile
+      SecurityGroupIds:
+        - !GetAtt GitHubAgentSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y docker git || yum install -y docker git
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+      Tags:
+        - Key: Name
+          Value: github_App
+  AwsSetupCallbackFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldCallback
+    DependsOn: GitHubAgentDeploymentRole
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 15
+      Role: !GetAtt AwsSetupCallbackRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request
+          def send_response(event, context, status, reason=''):
+              body = {
+                  'Status': status,
+                  'Reason': reason or 'See CloudWatch logs',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {}
+              }
+              data = json.dumps(body).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=data, method='PUT',
+                                           headers={'content-type':'','content-length':str(len(data))})
+              urllib.request.urlopen(req, timeout=10).read()
+          def handler(event, context):
+              try:
+                  props = event.get('ResourceProperties', {})
+                  callback = props.get('CallbackURL','').strip()
+                  token = props.get('SetupToken','').strip()
+                  if event.get('RequestType') == 'Delete':
+                      send_response(event, context, 'SUCCESS', 'Setup callback removed')
+                      return
+                  payload = {
+                      'setup_token': token,
+                      'status': 'connected',
+                      'account_id': props.get('AccountId',''),
+                      'region': props.get('Region',''),
+                      'role_arn': props.get('RoleArn',''),
+                      'stack_id': event.get('StackId','')
+                  }
+                  data = json.dumps(payload).encode('utf-8')
+                  req = urllib.request.Request(callback, data=data, method='POST',
+                                               headers={'content-type':'application/json',
+                                                        'content-length':str(len(data))})
+                  urllib.request.urlopen(req, timeout=10).read()
+                  send_response(event, context, 'SUCCESS', 'AWS Agent connection callback delivered')
+              except Exception as exc:
+                  print('callback error:', repr(exc))
+                  send_response(event, context, 'SUCCESS', 'Callback delivery failed; manual fallback remains available')
+
+  AwsSetupCallbackRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCallback
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AwsSetupCallback:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: ShouldCallback
+    DependsOn: GitHubAgentDeploymentRole
+    Properties:
+      ServiceToken: !GetAtt AwsSetupCallbackFunction.Arn
+      SetupToken: !Ref SetupToken
+      CallbackURL: !Ref CallbackURL
+      AccountId: !Ref 'AWS::AccountId'
+      Region: !Ref 'AWS::Region'
+      RoleArn: !GetAtt GitHubAgentDeploymentRole.Arn
+
+Outputs:
+  GitHubAgentRoleArn:
+    Description: Non-secret role ARN to paste into GitHub Agent
+    Value: !GetAtt GitHubAgentDeploymentRole.Arn
+  GitHubAgentEC2InstanceId:
+    Description: EC2 instance ID created for the Agent (only present when CreateEC2Instance was true)
+    Condition: ShouldCreateEC2
+    Value: !Ref GitHubAgentEC2Instance
