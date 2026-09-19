@@ -1,0 +1,8 @@
+streamlit>=1.63.0
+PyGithub>=2.3.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+
+# AWS setup callback service (only needed when running aws_setup_service locally)
+boto3>=1.35.0
